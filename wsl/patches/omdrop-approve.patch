@@ -1,0 +1,66 @@
+--- a/bin/airdrop-serve.py	2026-10-13 18:41:22.356879500 -0300
++++ b/bin/airdrop-serve.py	2026-10-13 18:41:37.576890000 -0300
+@@ -974,6 +974,12 @@
+             # so an Upload that never passed an Ask has nothing vouching for it.
+             self._contacts_ok = True
+ 
++        if not ask_approved(ask, self.client_address[0]):
++            self.send_response(403)
++            self.send_header('Content-Length', '0')
++            self.end_headers()
++            return
++
+         # A `links` transfer is Ask-only: with SUPPORTS_URL (0x01) advertised,
+         # iOS puts the URL straight into Items and sends no /Upload at all, so
+         # accepting the Ask IS the transfer. Store it, or the link is lost.
+@@ -1129,6 +1135,50 @@
+     debugdump.dump(name, data)
+ 
+ 
++# Asking a person before accepting. With OMDROP_APPROVE_DIR set, each Ask is
++# written there as <id>.ask (JSON) and the answer is awaited as <id>.yes or
++# <id>.no, written by whatever shows the prompt. No answer within
++# APPROVE_WAIT seconds declines, as a Mac does when nobody clicks: the sender
++# shows "Declined". Unset, every Ask is accepted (upstream behaviour).
++APPROVE_DIR = os.environ.get('OMDROP_APPROVE_DIR')
++APPROVE_WAIT = 55
++
++
++def ask_approved(ask, peer):
++    if not APPROVE_DIR:
++        return True
++    import uuid
++    rid = uuid.uuid4().hex
++    base = os.path.join(APPROVE_DIR, rid)
++    files = [{'name': str(f.get('FileName') or ''), 'type': str(f.get('FileType') or ''),
++              'size': int(f.get('FileSize') or 0)} for f in (ask.get('Files') or [])]
++    links = [i for i in (ask.get('Items') or []) if isinstance(i, str)]
++    request = {'id': rid, 'sender': str(ask.get('SenderComputerName') or 'Unknown'),
++               'model': str(ask.get('SenderModelName') or ''), 'peer': peer,
++               'files': files, 'links': links, 'time': time.time()}
++    with open(base + '.tmp', 'w') as f:
++        json.dump(request, f)
++    os.replace(base + '.tmp', base + '.ask')
++    deadline = time.monotonic() + APPROVE_WAIT
++    answer = False
++    try:
++        while time.monotonic() < deadline:
++            if os.path.exists(base + '.yes'):
++                answer = True
++                break
++            if os.path.exists(base + '.no'):
++                break
++            time.sleep(0.1)
++    finally:
++        for ext in ('.ask', '.yes', '.no'):
++            try:
++                os.unlink(base + ext)
++            except FileNotFoundError:
++                pass
++    logging.info('ask %s: %s', rid, 'approved' if answer else 'declined')
++    return answer
++
++
+ APPLE_ROOT = contacts.apple_root_ca()
+ if APPLE_ROOT is None:
+     raise SystemExit(f'Apple root CA certificate missing: {contacts.APPLE_ROOT_CA}')

@@ -1,0 +1,11 @@
+# Rust build artifacts
+/app/target/
+
+# The rejected LAN-only experiment, not part of OwlDrop
+/pcdrop/
+
+# OS / editor cruft
+Thumbs.db
+Desktop.ini
+*.swp
+*~

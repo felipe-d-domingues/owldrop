@@ -1,0 +1,36 @@
+[package]
+name = "owldrop"
+version = "0.1.0"
+edition = "2021"
+description = "OwlDrop: AirDrop for Windows — a UI over omdrop/OWL running in WSL on a USB AR9271"
+default-run = "owldrop"
+
+[[bin]]
+name = "owldrop"
+path = "src/main.rs"
+
+[[bin]]
+name = "owldrop-ble"
+path = "src/bin/owldrop-ble.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tauri-winrt-notification = "0.7"
+windows = { version = "0.61", features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Devices_Bluetooth_Advertisement",
+    "Storage_Streams",
+] }
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

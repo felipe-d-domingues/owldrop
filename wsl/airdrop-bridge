@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""The Windows app's one connection into WSL: JSON lines on stdin/stdout.
+
+Runs as root (wsl -u root). Drives the radio through airdrop-wsl, turns the
+receiver's log and approval requests into events, and carries out commands.
+The AirDrop protocol itself stays in omdrop's receiver and sender.
+
+Commands (one JSON object per line on stdin):
+  {"cmd":"on","secs":0,"name":"Achilles","outdir":"/mnt/c/...","user":"felipe"}
+  {"cmd":"off"}
+  {"cmd":"decide","id":"...","accept":true}
+  {"cmd":"peers"}
+  {"cmd":"send","to":"aa:bb:..","name":"Achilles","files":["/mnt/f/..."]}
+  {"cmd":"status"}
+
+Events (stdout): status, ask, ask_closed, received, failed, peer, peers_done,
+send_log, send_done, error, log.
+"""
+import glob
+import json
+import os
+import pwd
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+CTL = '/usr/local/sbin/airdrop-wsl'
+LIB = '/usr/lib/omdrop'
+RUN = '/run/omdrop-owl'
+ASKS = f'{RUN}/asks'
+RLOG = f'{RUN}/receiver.log'
+OWL_LOG = f'{RUN}/owl.log'
+# Received files land on a Linux filesystem first: the receiver truncates an
+# unlinked temporary file while storing, which drvfs (/mnt/c) answers with
+# ENOENT. They are moved to the Windows folder once complete.
+INBOX = '/var/lib/airdrop/inbox'
+
+# send-to-peer calls `pkexec omdrop-discoverable peers`; airdrop-wsl install
+# puts a root-only stand-in here, since WSL has no polkit session.
+# The sender also needs the identity the receiver advertises, which lives in
+# the receiving user's ~/.omdrop; run as root, omdrop's tools find that user
+# through SUDO_UID.
+def sender_env():
+    uid = state.get('uid')
+    if uid is None:  # before any `on`: the distro's first regular user
+        uid = next((u.pw_uid for u in pwd.getpwall() if 1000 <= u.pw_uid < 60000), 0)
+    return {**os.environ, 'SUDO_UID': str(uid),
+            'PATH': '/usr/local/lib/airdrop/bin:' + os.environ.get('PATH', '/usr/bin:/bin')}
+
+out_lock = threading.Lock()
+state = {'outdir': None, 'asks': {}, 'last_sender': None}
+
+
+def emit(ev, **kw):
+    with out_lock:
+        sys.stdout.write(json.dumps({'ev': ev, **kw}) + '\n')
+        sys.stdout.flush()
+
+
+def run(*args, timeout=90):
+    try:
+        r = subprocess.run([CTL, *args], capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return 124, 'timed out'
+
+
+def status():
+    rc, out = run('status', timeout=30)
+    try:
+        s = json.loads(out.splitlines()[-1])
+    except (ValueError, IndexError):
+        s = {}
+    try:
+        with open(OWL_LOG) as f:
+            peers = set()
+            for line in f:
+                m = re.search(r'(add|remove) peer (\S+)', line)
+                if m:
+                    (peers.add if m[1] == 'add' else peers.discard)(m[2])
+        s['awdl_peers'] = len(peers)
+    except OSError:
+        s['awdl_peers'] = 0
+    return s
+
+
+# --------------------------------------------------------------- watchers
+
+def watch_asks():
+    """Approval requests the patched receiver writes, and their withdrawal."""
+    while True:
+        seen = set()
+        for path in glob.glob(f'{ASKS}/*.ask'):
+            rid = os.path.basename(path)[:-4]
+            seen.add(rid)
+            if rid not in state['asks']:
+                try:
+                    with open(path) as f:
+                        req = json.load(f)
+                except (OSError, ValueError):
+                    continue
+                state['asks'][rid] = req
+                emit('ask', **req)
+        for rid in list(state['asks']):
+            if rid not in seen:
+                del state['asks'][rid]
+                emit('ask_closed', id=rid)
+        time.sleep(0.15)
+
+
+def unique(dest_dir, name):
+    stem, ext = os.path.splitext(name)
+    cand, i = name, 1
+    while os.path.exists(os.path.join(dest_dir, cand)):
+        cand = f'{stem} ({i}){ext}'
+        i += 1
+    return os.path.join(dest_dir, cand)
+
+
+def deliver(names):
+    out = state['outdir'] or INBOX
+    os.makedirs(out, exist_ok=True)
+    moved = []
+    for n in names:
+        src = n if n.startswith('/') else os.path.join(INBOX, n)
+        if not os.path.exists(src):
+            continue
+        dst = unique(out, os.path.basename(src))
+        shutil.move(src, dst)
+        moved.append({'path': dst, 'size': os.path.getsize(dst)})
+    return moved
+
+
+def follow_receiver():
+    """The receiver's log: who asked, what was stored, what failed."""
+    while not os.path.exists(RLOG):
+        time.sleep(0.5)
+    f = open(RLOG)
+    f.seek(0, os.SEEK_END)
+    ino = os.fstat(f.fileno()).st_ino
+    while True:
+        line = f.readline()
+        if not line:
+            time.sleep(0.2)
+            try:  # `on` truncates or recreates the log
+                st = os.stat(RLOG)
+                if st.st_ino != ino or st.st_size < f.tell():
+                    f.close()
+                    f = open(RLOG)
+                    ino = os.fstat(f.fileno()).st_ino
+            except OSError:
+                pass
+            continue
+        line = line.rstrip('\n')
+        m = re.search(r'ask from (.+?) \((.*?)\): type (\S+), (\d+) item', line)
+        if m:
+            state['last_sender'] = {'name': m[1], 'model': m[2]}
+            continue
+        m = re.search(r'upload (\S+): stored (.+)$', line)
+        if m:
+            try:
+                files = deliver([s.strip() for s in m[2].split(',') if s.strip()])
+                emit('received', transfer=m[1], sender=state['last_sender'], files=files, time=time.time())
+            except OSError as e:
+                emit('failed', sender=state['last_sender'], reason=f'could not move into {state["outdir"]}: {e}')
+            continue
+        m = re.search(r'link stored as (.+?) -> (\S+)', line)
+        if m:
+            files = deliver([m[1]])
+            emit('received', transfer='link', sender=state['last_sender'], files=files, url=m[2], time=time.time())
+            continue
+        m = re.search(r'WARNING root: /?(Upload|Ask) rejected: (.+)$', line) or \
+            re.search(r'"POST /Upload HTTP/1.1" ([45]\d\d)', line)
+        if m and 'rejected' in line:
+            emit('failed', sender=state['last_sender'], reason=m[2])
+
+
+def feed_firmware():
+    # Firmware for a dongle that usbipd re-attaches mid-session (airdrop-wsl
+    # explains why the kernel can't read it itself).
+    subprocess.run([CTL, 'feeder'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def report_status():
+    last = None
+    while True:
+        s = status()
+        if s != last:
+            emit('status', **s)
+            last = s
+        time.sleep(3)
+
+
+# --------------------------------------------------------------- commands
+
+def cmd_on(c):
+    state['outdir'] = c.get('outdir')
+    user = c.get('user') or 'root'
+    pw = pwd.getpwnam(user)
+    state['uid'] = pw.pw_uid
+    for d in (INBOX, ASKS):
+        os.makedirs(d, exist_ok=True)
+        os.chown(d, pw.pw_uid, pw.pw_gid)
+    rc, out = run('on', str(int(c.get('secs') or 0)), c.get('name') or 'Windows PC', INBOX, user, ASKS)
+    if rc:
+        emit('error', op='on', code=rc, message=out.splitlines()[-1] if out else f'exit {rc}')
+    emit('status', **status())
+
+
+def driver_ready():
+    return os.path.exists(f'/opt/airdrop/modules/{os.uname().release}/ath9k_htc.ko')
+
+
+def cmd_rebuild(c):
+    """Build the AR9271 driver for the running kernel (after a WSL update),
+    reporting the build script's STEP lines."""
+    repo = c.get('repo') or ''
+    script = os.path.join(repo, 'wsl', 'build-ath9k.sh')
+    if not os.path.exists(script):
+        return emit('rebuild_done', ok=False, message=f'no build script at {script}')
+    with open(script) as f:
+        body = f.read().replace(chr(13), '')
+    p = subprocess.Popen(['bash', '-c', body, 'build-ath9k.sh', repo],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    last = ''
+    for line in p.stdout:
+        line = line.strip()
+        if line.startswith('STEP '):
+            emit('rebuild_step', text=line[5:])
+        if line:
+            last = line
+    ok = p.wait() == 0 and driver_ready()
+    emit('rebuild_done', ok=ok, message='driver built' if ok else last)
+    emit('hello', inbox=INBOX, kernel=os.uname().release, driver=driver_ready())
+
+
+def cmd_off(_):
+    rc, out = run('off')
+    if rc:
+        emit('error', op='off', code=rc, message=out)
+    emit('status', **status())
+
+
+def cmd_decide(c):
+    rid = re.sub(r'[^0-9a-f]', '', c.get('id', ''))
+    if rid and os.path.exists(f'{ASKS}/{rid}.ask'):
+        open(f'{ASKS}/{rid}.{"yes" if c.get("accept") else "no"}', 'w').close()
+
+
+ROW = re.compile(r'^(\S+)\s+(.+?)\s+\[(\S+)\]:(\d+)(?:\s+(.*))?$')
+
+
+scan = {'gen': 0}
+SCAN_SECONDS = 45
+
+
+def link_local(mac):
+    m = [int(x, 16) for x in mac.split(':')]
+    m[0] ^= 2
+    return 'fe80::%02x%02x:%02xff:fe%02x:%02x%02x' % tuple(m)
+
+
+def classify(mac):
+    """Why a device heard on AWDL gave no name: 'contacts' when it refuses
+    our self-signed certificate (a receiver in Contacts Only does that to any
+    sender without an Apple-issued identity), 'asleep' when nothing answers."""
+    import ssl
+    keys = os.path.join(pwd.getpwuid(int(sender_env()['SUDO_UID'])).pw_dir, '.omdrop', 'keys')
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    # TLS 1.2: the server's verdict on our certificate arrives in the handshake.
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        ctx.load_cert_chain(f'{keys}/certificate.self-signed.pem', f'{keys}/key.self-signed.pem')
+        with socket.create_connection((link_local(mac) + '%awdl0', 8770), timeout=4) as s:
+            ctx.wrap_socket(s).close()
+        return None
+    except ssl.SSLError as e:
+        return 'contacts' if 'BAD_CERTIFICATE' in str(e).upper() else 'tls'
+    except OSError:
+        return 'asleep'
+
+
+def cmd_peers(c):
+    """Find nearby devices and their names, for SCAN_SECONDS.
+
+    An iPhone or Mac only brings AWDL up, and answers, shortly after a sender's
+    BLE AirDrop advert; one `send-to-peer --list` reads the peer table before
+    anything has been woken and finds it empty. So the whole scan advertises
+    (through the Windows Bluetooth shim) while the table is polled, and every
+    device heard is asked its name. omdrop's panel gets the same effect by
+    re-running the lookup while its section is open."""
+    scan['gen'] += 1
+    gen = scan['gen']
+    seconds = int(c.get('seconds') or SCAN_SECONDS)
+    wake = subprocess.Popen(['python3', f'{LIB}/ble-airdrop-adv.py', '--arm', 'A', '--seconds', str(seconds)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=sender_env())
+    named, why = set(), {}
+    end = time.monotonic() + seconds
+    try:
+        while time.monotonic() < end and scan['gen'] == gen:
+            p = subprocess.Popen(['python3', f'{LIB}/send-to-peer', '--list', '-n', '--stream', '--no-wake',
+                                  '--name', c.get('name') or 'Windows PC'],
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=sender_env())
+            for line in p.stdout:
+                m = ROW.match(line.strip())
+                if not m or m[1] in named:
+                    continue
+                label = m[5] or ''
+                name = None if label.startswith('(') else label
+                if name:
+                    named.add(m[1])
+                elif why.get(m[1]) != 'contacts':
+                    why[m[1]] = classify(m[1]) or why.get(m[1])
+                emit('peer', addr=m[1], signal=m[2], name=name, note=None if name else why.get(m[1]) or 'asleep')
+            p.wait()
+            time.sleep(1.5)
+    finally:
+        wake.terminate()
+        if scan['gen'] == gen:
+            emit('peers_done', found=len(named))
+
+
+def cmd_cancel_send(_):
+    p = state.pop('send_proc', None)
+    if p and p.poll() is None:
+        p.terminate()
+
+
+def cmd_stop_scan(_):
+    scan['gen'] += 1
+
+
+def cmd_send(c):
+    files = [f for f in c.get('files', []) if os.path.exists(f)]
+    if not files:
+        return emit('send_done', ok=False, message='no files to send')
+    # Keep the BLE wake up for the whole send, as during the scan where the
+    # device answered: an iPhone listens on 8770 only in bursts after a wake,
+    # and send-to-peer's own (shorter) wake wasn't enough to reopen it.
+    wake = subprocess.Popen(['python3', f'{LIB}/ble-airdrop-adv.py', '--arm', 'A', '--seconds', '150'],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=sender_env())
+    try:
+        # --no-wake: the wake above is already on air; a second one from
+        # send-to-peer only fails to register beside it.
+        p = subprocess.Popen(['python3', f'{LIB}/send-to-peer', '--mac', c['to'], '--name', c.get('name') or 'Windows PC',
+                              '--no-wake', '--wait', '60', *files], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, env=sender_env())
+        state['send_proc'] = p
+        last = ''
+        for line in p.stdout:
+            line = line.strip()
+            if line and 'PIL.' not in line:  # Pillow's plugin chatter
+                last = line
+                emit('send_log', text=last)
+        rc = p.wait()
+        if state.pop('send_proc', None) is None:
+            last = 'cancelled'
+    finally:
+        wake.terminate()
+    emit('send_done', ok=rc == 0, message='sent' if rc == 0 else last)
+
+
+COMMANDS = {'on': cmd_on, 'off': cmd_off, 'decide': cmd_decide, 'peers': cmd_peers, 'stop_scan': cmd_stop_scan,
+            'send': cmd_send, 'cancel_send': cmd_cancel_send, 'rebuild': cmd_rebuild,
+            'status': lambda _: emit('status', **status())}
+
+
+def main():
+    os.makedirs(ASKS, exist_ok=True)
+    for target in (watch_asks, follow_receiver, feed_firmware, report_status):
+        threading.Thread(target=target, daemon=True).start()
+    emit('hello', inbox=INBOX, kernel=os.uname().release, driver=driver_ready())
+    for line in sys.stdin:
+        try:
+            c = json.loads(line)
+        except ValueError:
+            continue
+        fn = COMMANDS.get(c.get('cmd'))
+        if fn:
+            # decide must never queue behind a long `peers` or `send`.
+            threading.Thread(target=lambda: _guard(fn, c), daemon=True).start()
+    # stdin closed: the app is gone. Don't leave the PC visible.
+    run('off')
+
+
+def _guard(fn, c):
+    try:
+        fn(c)
+    except Exception as e:  # noqa: BLE001 -- report, keep the bridge alive
+        emit('error', op=c.get('cmd'), message=repr(e))
+
+
+if __name__ == '__main__':
+    main()

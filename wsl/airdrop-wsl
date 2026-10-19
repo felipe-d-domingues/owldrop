@@ -1,0 +1,174 @@
+#!/bin/bash
+# The Linux half of AirDrop on Windows: runs as root inside WSL and drives
+# omdrop-owl (AWDL through OWL on the USB AR9271, passed in by usbipd) and
+# omdrop's receiver and sender. airdrop-bridge (driven by the Windows app) calls this; nothing here
+# knows about Windows except the paths it is given.
+#
+#   airdrop-wsl install REPO_WSL_PATH APP_EXE_WSL_PATH
+#   airdrop-wsl on SECONDS NAME OUTDIR USER [ASKDIR]   radio up, visible, receiving;
+#                                                with ASKDIR, every Ask waits for approval
+#   airdrop-wsl off
+#   airdrop-wsl status                           one JSON line
+#   airdrop-wsl peers                            nearby devices, with names
+#   airdrop-wsl send NAME|ADDRESS SENDERNAME FILE...
+#   airdrop-wsl follow                           the receiver's log, live
+set -uo pipefail
+
+BASE=/opt/airdrop
+LIB=/usr/lib/omdrop
+RUN=/run/omdrop-owl
+MODS=$BASE/modules/$(uname -r)
+PY=$BASE/venv/bin/python
+SERVE=$BASE/omdrop-plugin/bin/airdrop-serve.py
+RLOG=$RUN/receiver.log
+
+die() { echo "airdrop-wsl: $1" >&2; exit "${2:-1}"; }
+[ "$(id -u)" = 0 ] || die "run as root (wsl -u root)"
+
+# The AR9271's interface, once the driver has bound it.
+wifi_iface() {
+  local d
+  for d in /sys/class/net/*; do
+    [ -e "$d/phy80211" ] || continue
+    [ "$(basename "$(readlink -f "$d/device/driver")")" = ath9k_htc ] && { basename "$d"; return 0; }
+  done
+  return 1
+}
+
+# The kernel loads firmware from the WSL utility VM's filesystem, not this
+# distro's, so /lib/firmware here is invisible to it. Forcing the sysfs
+# fallback makes each request wait in /sys/class/firmware/<name>/ (a '/' in the
+# name becomes '!') for userspace to write the file: we answer from here, and
+# cancel requests we can't fill so the driver moves on to its next name.
+answer_firmware() {
+  local d name f
+  for d in /sys/class/firmware/*/; do
+    [ -e "$d/loading" ] || continue
+    name=$(basename "$d"); f=/lib/firmware/${name//!//}
+    if [ -f "$f" ]; then
+      echo 1 > "$d/loading" && cat "$f" > "$d/data" && echo 0 > "$d/loading"
+    else
+      echo -1 > "$d/loading"
+    fi
+  done
+}
+
+feed_firmware() {  # SECONDS
+  local end=$(( $(date +%s) + $1 ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    answer_firmware
+    wifi_iface >/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+radio_up() {
+  wifi_iface >/dev/null && return 0
+  # A WSL update can bring a new kernel; the driver is built per kernel.
+  [ -f "$MODS/ath9k_htc.ko" ] || die "the Wi-Fi driver isn't built for kernel $(uname -r) yet (WSL was updated)" 7
+  modprobe cfg80211 && modprobe mac80211 && modprobe led_class || die "the WSL kernel has no cfg80211/mac80211/led_class"
+  local m
+  for m in ath ath9k_hw ath9k_common; do
+    lsmod | grep -q "^$m " || insmod "$MODS/$m.ko" || die "could not load $m from $MODS (run wsl/build-ath9k.sh)"
+  done
+  # Left on: a dongle re-attached later (usbipd --auto-attach) asks again.
+  echo 1 > /proc/sys/kernel/firmware_config/force_sysfs_fallback
+  if ! lsmod | grep -q "^ath9k_htc "; then
+    insmod "$MODS/ath9k_htc.ko" || die "could not load ath9k_htc from $MODS (run wsl/build-ath9k.sh)"
+  fi
+  feed_firmware 20 && return 0
+  # A probe whose firmware load failed leaves the device unconfigured, and
+  # neither a driver reload nor re-authorizing brings it back: only a fresh
+  # USB attach does, which is Windows' job (exit 6).
+  lsusb -d 0cf3:9271 >/dev/null 2>&1 && [ ! -e /sys/bus/usb/devices/1-1:1.0 ] \
+    && die "the AR9271 needs to be re-attached (usbipd detach, then attach)" 6
+  lsusb -d 0cf3:9271 >/dev/null 2>&1 || die "the AR9271 isn't attached to WSL (usbipd attach)" 4
+  die "the AR9271 is attached but its interface never appeared (firmware?): $(dmesg | grep -i ath9k | tail -2)" 4
+}
+
+receiver_pid() { local p; p=$(cat "$RUN/receiver.pid" 2>/dev/null) && [ -d "/proc/$p" ] && echo "$p"; }
+
+cmd_install() {
+  local repo=$1 app=$2
+  mkdir -p "$LIB" /etc/omdrop
+  cp -f "$BASE"/omdrop-owl/build/lib/* "$LIB/"
+  install -m 755 <(tr -d '\r' < "$repo/wsl/ble-airdrop-adv.py") "$LIB/ble-airdrop-adv.py"
+  install -m 755 <(tr -d '\r' < "$repo/wsl/airdrop-wsl") /usr/local/sbin/airdrop-wsl
+  install -m 755 <(tr -d '\r' < "$repo/wsl/airdrop-bridge") /usr/local/sbin/airdrop-bridge
+  # send-to-peer reads the peer table through pkexec, and WSL has no polkit
+  # session ("no seat"). The bridge is already root and puts this first on
+  # its own PATH only: it runs the command as is, and refuses anyone else.
+  mkdir -p /usr/local/lib/airdrop/bin
+  printf '%s\n' '#!/bin/sh' '[ "$(id -u)" = 0 ] || { echo "pkexec stand-in: root only" >&2; exit 126; }' 'exec "$@"' \
+    > /usr/local/lib/airdrop/bin/pkexec
+  chmod 755 /usr/local/lib/airdrop/bin/pkexec
+  # omdrop's receiver, with the hook that asks before accepting.
+  git -C "$BASE/omdrop-plugin" checkout -q -- bin/airdrop-serve.py
+  tr -d '\r' < "$repo/wsl/patches/omdrop-approve.patch" | patch -s -d "$BASE/omdrop-plugin" -p1 \
+    || die "the approval patch no longer applies to omdrop's receiver"
+  # The AR9271 is a dedicated dongle (the PC is on Ethernet): exclusive mode,
+  # where the card is AWDL's alone, an ad-hoc cell on channel 6 ACKs the
+  # phone's frames and OWL injects through a monitor interface.
+  printf '%s\n' 'ath9k_htc  untested  exclusive  station  no  no  Atheros AR9271 (USB, 2.4 GHz only), in WSL2 through usbipd.' \
+    > /etc/omdrop/owl-profiles
+  echo 1 > /etc/omdrop/allow-untested
+  # The Windows app also broadcasts the Bluetooth wake advert (ble-adv).
+  printf '%s\n' "$app" > /etc/omdrop/windows-ble
+  echo "installed"
+}
+
+cmd_on() {
+  local secs=$1 name=$2 outdir=$3 user=$4 askdir=${5:-} rc
+  radio_up
+  mkdir -p "$RUN"
+  "$LIB/omdrop-discoverable" start "$secs"; rc=$?
+  [ "$rc" = 0 ] || [ "$rc" = 5 ] || exit "$rc"
+  if [ -z "$(receiver_pid)" ]; then
+    runuser -u "$user" -- mkdir -p "$outdir"
+    : > "$RLOG"; chown "$user" "$RLOG"
+    setsid runuser -u "$user" -- env OMDROP_APPROVE_DIR="$askdir" "$PY" -u "$SERVE" --iface awdl0 --port 8771 \
+      --name "$name" --outdir "$outdir" >> "$RLOG" 2>&1 < /dev/null &
+    echo $! > "$RUN/receiver.pid"
+  fi
+  sleep 1
+  [ -n "$(receiver_pid)" ] || die "the receiver exited: $(tail -2 "$RLOG")"
+  echo "visible"
+}
+
+cmd_off() {
+  local p
+  p=$(receiver_pid) && { pkill -P "$p" 2>/dev/null; kill "$p" 2>/dev/null; }
+  pkill -f -- "$SERVE" 2>/dev/null
+  rm -f "$RUN/receiver.pid"
+  [ -x "$LIB/omdrop-discoverable" ] && "$LIB/omdrop-discoverable" stop
+  echo "off"
+}
+
+cmd_status() {
+  local st recv=false iface
+  st=$("$LIB/omdrop-discoverable" status --json 2>/dev/null || echo '{}')
+  [ -n "$(receiver_pid)" ] && recv=true
+  iface=$(wifi_iface || true)
+  ST=$st R=$recv I=$iface python3 -c '
+import json, os
+s = json.loads(os.environ["ST"] or "{}")
+s.update(receiving=os.environ["R"] == "true", radio=os.environ["I"] or None)
+print(json.dumps(s))'
+}
+
+case "${1:-}" in
+  install) shift; cmd_install "$@" ;;
+  on)      shift; cmd_on "$@" ;;
+  off)     cmd_off ;;
+  status)  cmd_status ;;
+  peers)   python3 "$LIB/send-to-peer" --list -n ;;
+  send)    shift; to=$1 sender=$2; shift 2
+           exec python3 "$LIB/send-to-peer" --mac "$to" --name "$sender" --wait 30 "$@" ;;
+  follow)  mkdir -p "$RUN"; touch "$RLOG"; exec tail -n 0 -F "$RLOG" ;;
+  radio)   radio_up; wifi_iface ;;
+  # Runs beside the agent's `follow`: answers firmware requests from a dongle
+  # that usbipd re-attaches mid-session.
+  feeder)  while true; do answer_firmware; sleep 0.5; done ;;
+  *) die "usage: airdrop-wsl install|on|off|status|peers|send|follow|radio" 2 ;;
+esac
